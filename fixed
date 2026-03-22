@@ -1,0 +1,234 @@
+import numpy as np
+import cv2
+import pygame
+from pygame.locals import *
+import os
+import sys
+import csv
+
+# --- 定数設定 ---
+ASPECT = (1920, 1200)
+TITLE = "SoramirukunV2_FastLoader"
+PATH_SAVE = "project\\clustering\\image\\save"  #要変更
+PATH_CACHE = "project\\clustering\\cache"  #要変更
+FPS = 60
+K = 10
+FONT_PARAMS = {"size":180, "font":None, "color":(0,255,0)}
+
+class pygame_manager:
+    def __init__(self, aspect, title, font_params):
+        pygame.init()
+        self.win = pygame.display.set_mode(aspect)
+        pygame.display.set_caption(title)
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont(font_params["font"], font_params["size"])
+
+    def convert_RGB2surface(self, img_RGB):
+        img_transposed = np.transpose(img_RGB, (1, 0, 2))
+        return pygame.surfarray.make_surface(img_transposed)
+
+    def render(self, surface):
+        self.win.blit(surface, (0,0))
+
+    def reset_win(self):
+        self.win.fill((0,0,0))
+
+    def update_win(self):
+        pygame.display.update()
+
+    def check_events(self):
+        for event in pygame.event.get():
+            if event.type == QUIT: return False, None
+            if event.type == KEYDOWN:
+                #if event.key == K_ESCAPE: return False, None
+                if K_0 <= event.key <= K_9: return True, event.key - K_0
+                if event.key == K_q: sys.exit()
+        return True, None
+
+    def tick(self, fps=60):
+        self.clock.tick(fps)
+
+    def render_surface_text(self, surface, text, color, pos):
+        text_surface = self.font.render(text, True, color)
+        surface.blit(text_surface, (pos[0], pos[1]))
+        return surface
+    
+    def render_square(self, surface, color, size, pos):
+        pygame.draw.rect(surface, color, (pos[0], pos[1], size[0], size[1]))
+
+    def save_window(self, path, size, pos):
+        rect = pygame.Rect(pos[0], pos[1], size[0], size[1])
+        sub = self.win.subsurface(rect).copy()
+        pygame.image.save(sub, path)
+
+class cv2_manager:
+    def __init__(self):
+        self.img_original = None
+        self.Kmeans_data = {}
+
+    def load_cache(self, path_cache):
+        # キャッシュからデータを展開
+        data = np.load(path_cache)
+        self.img_original = data['original']
+        self.Kmeans_data = {
+            "labels": data['labels'], 
+            "centers": data['centers'], 
+            "aspect": data['shape']
+        }
+
+    def convert_BGR2RGB(self, img_BGR):
+        return cv2.cvtColor(img_BGR, cv2.COLOR_BGR2RGB)
+
+    def filder_cluster(self, target_clusters):
+        labels_flat = self.Kmeans_data["labels"].flatten()
+        mask = np.isin(labels_flat, target_clusters)
+        filtered = np.zeros((len(labels_flat), 3), dtype=np.uint8)
+        filtered[mask] = self.Kmeans_data["centers"][labels_flat[mask]]
+        return filtered.reshape(self.Kmeans_data["aspect"])
+
+    def get_mask(self, clusters):
+        mask_flat = np.isin(self.Kmeans_data["labels"].flatten(), clusters)
+        return (mask_flat.astype(np.uint8) * 255).reshape(self.Kmeans_data["aspect"][:2])
+
+    def get_masked_imgBGR(self, clusters):
+        mask = self.get_mask(clusters)
+        return cv2.bitwise_and(self.img_original, self.img_original, mask=mask)
+
+    def analysis_weather(self, img_mask):
+        px_total = img_mask.size
+        px_white = cv2.countNonZero(img_mask)
+        cld_per = px_white / px_total
+        
+        if cld_per <= 0.01: weather = "Clear"
+        elif cld_per <= 0.08: weather = "Sunny"
+        else: weather = "Cloudy"
+        
+        contours, _ = cv2.findContours(img_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        return cld_per, weather, contours
+
+    def render_contours(self, contours):
+        return cv2.drawContours(self.img_original.copy(), contours, -1, (0, 0, 255), 5)
+    
+    def render_result_image(self, contours, weather, cld_per, cld_clr, timestamp):
+        img_res = self.render_contours(contours)
+        text = f"{weather} ({cld_per*100:.2f}%)"
+        cv2.putText(img_res, text, (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 5)
+    
+        time_display = timestamp.replace(".", ":")
+        cv2.putText(img_res, time_display, (20, 210), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 5)
+
+        cv2.rectangle(img_res, (20, 250), (220, 350), (cld_clr, cld_clr, cld_clr), -1)
+        # 四角形の枠線（お好みで）
+        cv2.rectangle(img_res, (20, 250), (220, 350), (0, 255, 0), 3)
+        
+        return img_res
+
+class SoramirukunV2:
+    def __init__(self, aspect, title, font_params):
+        self.aspect = aspect
+        self.font_params = font_params
+        self.cv2_m = cv2_manager()
+        self.pygame_m = pygame_manager(aspect, title, font_params)
+        self.cld_per = None
+
+    def run(self, path_cache, filename, path_save, k, fps=60):
+        # データロード
+        self.cv2_m.load_cache(path_cache)
+        self.target_clusters = list(range(k))
+        self.update_cluster_view()
+
+        # ループ1: マスク選択
+        selecting = True
+        while selecting:
+            self.pygame_m.reset_win()
+            self.pygame_m.render(self.surface)
+            self.pygame_m.update_win()
+            self.pygame_m.tick(fps)
+            
+            running, key = self.pygame_m.check_events()
+            if not running: return False # 終了
+            
+            if key is not None and 0 <= key < k:
+                if key in self.target_clusters: self.target_clusters.remove(key)
+                else: self.target_clusters.append(key)
+                self.update_cluster_view()
+            
+            if key is None and pygame.key.get_pressed()[K_RETURN]: # Enterで確定
+                selecting = False
+
+        # 解析結果の表示と保存
+        mask, img_res = self.update_result_view(filename)
+        
+        waiting = True
+        while waiting:
+            self.pygame_m.render(self.surface)
+            self.pygame_m.update_win()
+            running, _ = self.pygame_m.check_events()
+            if not running or pygame.key.get_pressed()[K_SPACE]: # Spaceで次へ
+                waiting = False
+
+        # 保存処理
+        os.makedirs(os.path.join(path_save, "result"), exist_ok=True)
+        os.makedirs(os.path.join(path_save, "mask"), exist_ok=True)
+        
+        # 1. OpenCVのデータを直接保存（これで余白が消える）
+        cv2.imwrite(os.path.join(path_save, "result", f"{filename}.jpg"), img_res)
+        cv2.imwrite(os.path.join(path_save, "mask", f"{filename}.png"), mask)
+
+        # 2. 雲量をCSVに保存
+        csv_path = os.path.join(path_save, "cloud_coverage.csv")
+        file_exists = os.path.isfile(csv_path)
+        with open(csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["filename", "cloud_coverage_percent"])
+            writer.writerow([filename, self.cld_per * 100])
+        
+        return True
+
+    def update_cluster_view(self):
+        img_bgr = self.cv2_m.filder_cluster(self.target_clusters)
+        self.surface = self.pygame_m.convert_RGB2surface(self.cv2_m.convert_BGR2RGB(img_bgr))
+
+    def update_result_view(self, filename):
+        mask = self.cv2_m.get_mask(self.target_clusters)
+        cld_per, weather, contours = self.cv2_m.analysis_weather(mask)
+        self.cld_per = cld_per # 保存用にインスタンス変数へ格納
+
+        # 平均色の計算
+        img_mono = cv2.cvtColor(self.cv2_m.get_masked_imgBGR(self.target_clusters), cv2.COLOR_BGR2GRAY)
+        cld_clr = cv2.mean(img_mono, mask=mask)[0]
+
+        pre_name = os.path.splitext(filename)[0]
+        img_res = self.cv2_m.render_result_image(contours, weather, cld_per, cld_clr, pre_name)
+
+        h, w = img_res.shape[:2]
+        win_w, win_h = self.aspect  # Pygameの (width, height)
+
+        # 2. アスペクト比を維持するための倍率を計算
+        # ウィンドウに収まるように、縦横どちらの倍率が小さいかを採用する
+        scale = min(win_w / w, win_h / h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+
+        # 3. リサイズ実行
+        resized_img = cv2.resize(img_res, (new_w, new_h))
+        self.surface = self.pygame_m.convert_RGB2surface(self.cv2_m.convert_BGR2RGB(resized_img))
+
+        return mask, img_res
+
+if __name__ == "__main__":
+    if not os.path.exists(PATH_CACHE):
+        print("キャッシュがありません。先に事前処理を行ってください。")
+        sys.exit()
+
+    cache_files = [f for f in os.listdir(PATH_CACHE) if f.endswith(".npz")]
+    S2 = SoramirukunV2(ASPECT, TITLE, FONT_PARAMS)
+    
+    for cf in cache_files:
+        original_name = cf.replace(".npz", "") # 元のファイル名
+        path_cache = os.path.join(PATH_CACHE, cf)
+        if not S2.run(path_cache, original_name, PATH_SAVE, K, FPS):
+            break
+    
+    pygame.quit()
